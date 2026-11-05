@@ -1,0 +1,306 @@
+name: Build RustDeskPL 1.5.0 for Windows x64
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: build-rustdesk-pl
+  cancel-in-progress: false
+env:
+  SCITER_RUST_VERSION: '1.75'
+  LLVM_VERSION: 15.0.6
+  FLUTTER_VERSION: 3.24.5
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+  VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  VCPKG_CMAKE_VERSION: 4.3.0
+  CARGO_EXPAND_VERSION: 1.0.95
+  FLUTTER_RUST_BRIDGE_VERSION: 1.80.1
+  RUST_VERSION: '1.75'
+jobs:
+  bridge:
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-unknown-linux-gnu
+          os: ubuntu-22.04
+          extra-build-args: ''
+          flutter-version: 3.22.3
+          artifact-name: bridge-artifact
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        repository: rustdesk/rustdesk
+        ref: fada664df7a294d1d1a9ca3e7cd3637069122f17
+        submodules: recursive
+        persist-credentials: false
+    - name: Set independent RustDeskPL identity
+      shell: bash
+      run: |
+        python - <<'PY'
+        from pathlib import Path
+        import subprocess
+        root = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        if root != 'fada664df7a294d1d1a9ca3e7cd3637069122f17':
+            raise SystemExit('Unexpected RustDesk source commit: ' + root)
+        p = Path('libs/hbb_common/src/config.rs')
+        old = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());'
+        new = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDeskPL".to_owned());'
+        text = p.read_text(encoding='utf-8')
+        if text.count(old) != 1:
+            raise SystemExit('Expected exactly one upstream APP_NAME declaration; no changes made')
+        p.write_text(text.replace(old, new), encoding='utf-8')
+        print('Changed only the default APP_NAME: RustDesk -> RustDeskPL')
+        PY
+    - name: Install prerequisites
+      run: |
+        sudo apt-get install ca-certificates -y
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          clang \
+          cmake \
+          curl \
+          gcc \
+          git \
+          g++ \
+          libclang-dev \
+          libgtk-3-dev \
+          llvm-dev \
+          nasm \
+          ninja-build \
+          pkg-config \
+          wget
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: bridge-${{ matrix.job.os }}
+    - name: Install flutter
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.flutter-version }}
+        cache: true
+    - name: Install flutter rust bridge deps
+      shell: bash
+      run: |
+        cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+        cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+        if [[ "${{ matrix.job.flutter-version }}" == "3.22.3" ]]; then
+          # Default Flutter 3.22.3: extended_text 14 needs a newer Dart, so downgrade for resolution.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+        else
+          # Flutter 3.44 bridge for Windows arm64: match that build's source/pubspec state so the
+          # generated *.freezed.dart compiles against the same Flutter/freezed it resolves.
+          bash .github/patches/apply_flutter_3.44_source_patches.sh
+        fi
+        pushd flutter && flutter pub get && popd
+    - name: Run flutter rust bridge
+      run: |
+        ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+        cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+    - name: Upload Artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ matrix.job.artifact-name }}
+        path: |
+          ./src/bridge_generated.rs
+          ./src/bridge_generated.io.rs
+          ./flutter/lib/generated_bridge.dart
+          ./flutter/lib/generated_bridge.freezed.dart
+          ./flutter/macos/Runner/bridge_generated.h
+          ./flutter/ios/Runner/bridge_generated.h
+    name: Generate bridge for RustDesk 1.5.0 x64
+    timeout-minutes: 90
+  windows:
+    name: Build and verify RustDeskPL 1.5.0 Windows x64
+    needs:
+    - bridge
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-pc-windows-msvc
+          os: windows-2022
+          arch: x86_64
+          flutter-arch: x64
+          vcpkg-triplet: x64-windows-static
+          build-args: --vram
+    steps:
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        repository: rustdesk/rustdesk
+        ref: fada664df7a294d1d1a9ca3e7cd3637069122f17
+        submodules: recursive
+        persist-credentials: false
+    - name: Set independent RustDeskPL identity
+      shell: bash
+      run: |
+        python - <<'PY'
+        from pathlib import Path
+        import subprocess
+        root = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        if root != 'fada664df7a294d1d1a9ca3e7cd3637069122f17':
+            raise SystemExit('Unexpected RustDesk source commit: ' + root)
+        p = Path('libs/hbb_common/src/config.rs')
+        old = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());'
+        new = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDeskPL".to_owned());'
+        text = p.read_text(encoding='utf-8')
+        if text.count(old) != 1:
+            raise SystemExit('Expected exactly one upstream APP_NAME declaration; no changes made')
+        p.write_text(text.replace(old, new), encoding='utf-8')
+        print('Changed only the default APP_NAME: RustDesk -> RustDeskPL')
+        PY
+    - name: Restore bridge files
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+        path: ./
+    - name: Install LLVM and Clang
+      uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+      with:
+        version: ${{ env.LLVM_VERSION }}
+    - name: Install flutter
+      id: flutter
+      uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_WINDOWS_ARM_VERSION || env.FLUTTER_VERSION
+          }}
+        architecture: x64
+    - name: Replace engine with rustdesk custom flutter engine
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      run: |
+        flutter doctor -v
+        flutter precache --windows
+        Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+        Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+        mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+    - name: Patch flutter
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      shell: bash
+      run: |
+        cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+        cd $(dirname $(dirname $(which flutter)))
+        if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+        fi
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.SCITER_RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: ${{ matrix.job.os }}
+    - name: Setup vcpkg with Github Actions binary cache
+      uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+      with:
+        vcpkgDirectory: C:\vcpkg
+        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        doNotCache: false
+    - name: Install vcpkg dependencies
+      env:
+        VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
+      run: |
+        if ! $VCPKG_ROOT/vcpkg \
+          install \
+          --triplet ${{ matrix.job.vcpkg-triplet }} \
+          --x-install-root="$VCPKG_ROOT/installed"; then
+          find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+            echo "$_1:"
+            echo "======"
+            cat "$_1"
+            echo "======"
+            echo ""
+          done
+          exit 1
+        fi
+        head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+      shell: bash
+    - name: Build rustdesk
+      run: |-
+        python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+        if ($LASTEXITCODE -ne 0) { throw "RustDesk build failed: $LASTEXITCODE" }
+        Move-Item ./flutter/build/windows/x64/runner/Release ./RustDeskPL
+        Rename-Item ./RustDeskPL/rustdesk.exe RustDeskPL.exe
+        Copy-Item ./LICENCE ./RustDeskPL/LICENCE -ErrorAction Stop
+    - name: Verify compiled application identity and record provenance
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $dist = (Resolve-Path './RustDeskPL').Path
+        $env:PATH = "$dist;$env:PATH"
+        Add-Type @'
+        using System;
+        using System.Runtime.InteropServices;
+        public static class RustDeskPLIdentity {
+          [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+          public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+          [DllImport("kernel32.dll", CharSet=CharSet.Ansi, ExactSpelling=true)]
+          public static extern IntPtr GetProcAddress(IntPtr module, string name);
+          [DllImport("kernel32.dll")]
+          public static extern bool FreeLibrary(IntPtr module);
+          [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+          public delegate int GetName(IntPtr buffer, int length);
+        }
+        '@
+        $dll = [RustDeskPLIdentity]::LoadLibraryExW((Join-Path $dist 'librustdesk.dll'), [IntPtr]::Zero, 8)
+        if ($dll -eq [IntPtr]::Zero) { throw "Cannot load client DLL: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+        $buffer = [IntPtr]::Zero
+        try {
+          $address = [RustDeskPLIdentity]::GetProcAddress($dll, 'get_rustdesk_app_name')
+          if ($address -eq [IntPtr]::Zero) { throw 'Missing identity export' }
+          $getName = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($address, [type][RustDeskPLIdentity+GetName])
+          $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal(1024)
+          [Runtime.InteropServices.Marshal]::Copy([byte[]]::new(1024), 0, $buffer, 1024)
+          if ($getName.Invoke($buffer, 512) -ne 0) { throw 'Cannot read client identity' }
+          $name = [Runtime.InteropServices.Marshal]::PtrToStringUni($buffer)
+          if ($name -cne 'RustDeskPL') { throw "Wrong identity: $name. Do not install this build." }
+          Write-Host "PASS: native client identity is $name"
+        } finally {
+          if ($buffer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
+          [void][RustDeskPLIdentity]::FreeLibrary($dll)
+        }
+        $root = git rev-parse HEAD
+        $submodules = git submodule status --recursive | Out-String
+        $diff = git -C libs/hbb_common diff -- src/config.rs | Out-String
+        $manifest = @{
+          application = 'RustDeskPL'
+          upstream_version = '1.5.0'
+          upstream_commit = $root
+          source = 'https://github.com/rustdesk/rustdesk'
+          native_identity_verified = $true
+          submodules = $submodules
+          patch = $diff
+          build_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+        }
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content ./RustDeskPL/BUILD-PROVENANCE.json -Encoding utf8
+        Get-ChildItem ./RustDeskPL -File -Recurse | ForEach-Object {
+          $relative = $_.FullName.Substring($dist.Length + 1).Replace('\','/')
+          $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $relative"
+        } | Set-Content ./RustDeskPL/SHA256SUMS.txt -Encoding ascii
+    - name: Upload test client directory
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: RustDeskPL-1.5.0-windows-x64
+        path: RustDeskPL/
+        if-no-files-found: error
+        retention-days: 14
+    timeout-minutes: 180
